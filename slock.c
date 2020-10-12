@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdarg.h>
@@ -18,6 +19,8 @@
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xresource.h>
+#include <Imlib2.h>
 
 #include "arg.h"
 #include "util.h"
@@ -35,6 +38,7 @@ struct lock {
 	int screen;
 	Window root, win;
 	Pixmap pmap;
+	Pixmap bgmap;
 	unsigned long colors[NUMCOLS];
 };
 
@@ -44,7 +48,22 @@ struct xrandr {
 	int errbase;
 };
 
+/* Xresources preferences */
+enum resource_type {
+	STRING = 0,
+	INTEGER = 1,
+	FLOAT = 2
+};
+
+typedef struct {
+	char *name;
+	enum resource_type type;
+	void *dst;
+} ResourcePref;
+
 #include "config.h"
+
+Imlib_Image image;
 
 static void
 die(const char *errstr, ...)
@@ -190,9 +209,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
 			if (running && oldc != color) {
 				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
+                    if(locks[screen]->bgmap)
+                        XSetWindowBackgroundPixmap(dpy, locks[screen]->win, locks[screen]->bgmap);
+                    else
+                        XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[0]);
 					XClearWindow(dpy, locks[screen]->win);
 				}
 				oldc = color;
@@ -235,6 +255,17 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	lock->screen = screen;
 	lock->root = RootWindow(dpy, lock->screen);
 
+    if(image) 
+    {
+        lock->bgmap = XCreatePixmap(dpy, lock->root, DisplayWidth(dpy, lock->screen), DisplayHeight(dpy, lock->screen), DefaultDepth(dpy, lock->screen));
+        imlib_context_set_image(image);
+        imlib_context_set_display(dpy);
+        imlib_context_set_visual(DefaultVisual(dpy, lock->screen));
+        imlib_context_set_colormap(DefaultColormap(dpy, lock->screen));
+        imlib_context_set_drawable(lock->bgmap);
+        imlib_render_image_on_drawable(0, 0);
+        imlib_free_image();
+    }
 	for (i = 0; i < NUMCOLS; i++) {
 		XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
 		                 colorname[i], &color, &dummy);
@@ -251,6 +282,8 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	                          CopyFromParent,
 	                          DefaultVisual(dpy, lock->screen),
 	                          CWOverrideRedirect | CWBackPixel, &wa);
+    if(lock->bgmap)
+        XSetWindowBackgroundPixmap(dpy, lock->win, lock->bgmap);
 	lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
@@ -295,6 +328,57 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 		fprintf(stderr, "slock: unable to grab keyboard for screen %d\n",
 		        screen);
 	return NULL;
+}
+
+int
+resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst)
+{
+	char **sdst = dst;
+	int *idst = dst;
+	float *fdst = dst;
+
+	char fullname[256];
+	char fullclass[256];
+	char *type;
+	XrmValue ret;
+
+	snprintf(fullname, sizeof(fullname), "%s.%s", "slock", name);
+	snprintf(fullclass, sizeof(fullclass), "%s.%s", "Slock", name);
+	fullname[sizeof(fullname) - 1] = fullclass[sizeof(fullclass) - 1] = '\0';
+
+	XrmGetResource(db, fullname, fullclass, &type, &ret);
+	if (ret.addr == NULL || strncmp("String", type, 64))
+		return 1;
+
+	switch (rtype) {
+	case STRING:
+		*sdst = ret.addr;
+		break;
+	case INTEGER:
+		*idst = strtoul(ret.addr, NULL, 10);
+		break;
+	case FLOAT:
+		*fdst = strtof(ret.addr, NULL);
+		break;
+	}
+	return 0;
+}
+
+void
+config_init(Display *dpy)
+{
+	char *resm;
+	XrmDatabase db;
+	ResourcePref *p;
+
+	XrmInitialize();
+	resm = XResourceManagerString(dpy);
+	if (!resm)
+		return;
+
+	db = XrmGetStringDatabase(resm);
+	for (p = resources; p < resources + LEN(resources); p++)
+		resource_load(db, p->name, p->type, p->dst);
 }
 
 static void
@@ -355,6 +439,62 @@ main(int argc, char **argv) {
 	if (setuid(duid) < 0)
 		die("slock: setuid: %s\n", strerror(errno));
 
+	config_init(dpy);
+
+	/*Create screenshot Image*/
+	Screen *scr = ScreenOfDisplay(dpy, DefaultScreen(dpy));
+	image = imlib_create_image(scr->width,scr->height);
+	imlib_context_set_image(image);
+	imlib_context_set_display(dpy);
+	imlib_context_set_visual(DefaultVisual(dpy,0));
+	imlib_context_set_drawable(RootWindow(dpy,XScreenNumberOfScreen(scr)));	
+	imlib_copy_drawable_to_image(0,0,0,scr->width,scr->height,0,0,1);
+
+#ifdef BLUR
+
+	/*Blur function*/
+	imlib_image_blur(blurRadius);
+#endif // BLUR	
+
+#ifdef PIXELATION
+	/*Pixelation*/
+	int width = scr->width;
+	int height = scr->height;
+	
+	for(int y = 0; y < height; y += pixelSize)
+	{
+		for(int x = 0; x < width; x += pixelSize)
+		{
+			int red = 0;
+			int green = 0;
+			int blue = 0;
+
+			Imlib_Color pixel; 
+			Imlib_Color* pp;
+			pp = &pixel;
+			for(int j = 0; j < pixelSize && j < height; j++)
+			{
+				for(int i = 0; i < pixelSize && i < width; i++)
+				{
+					imlib_image_query_pixel(x+i,y+j,pp);
+					red += pixel.red;
+					green += pixel.green;
+					blue += pixel.blue;
+				}
+			}
+			red /= (pixelSize*pixelSize);
+			green /= (pixelSize*pixelSize);
+			blue /= (pixelSize*pixelSize);
+			imlib_context_set_color(red,green,blue,pixel.alpha);
+			imlib_image_fill_rectangle(x,y,pixelSize,pixelSize);
+			red = 0;
+			green = 0;
+			blue = 0;
+		}
+	}
+	
+	
+#endif
 	/* check for Xrandr support */
 	rr.active = XRRQueryExtension(dpy, &rr.evbase, &rr.errbase);
 
