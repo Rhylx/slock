@@ -23,8 +23,8 @@ ResourcePref resources[] = {
 /*Enable blur*/
 #define BLUR
 /*Set blur radius*/
-static const int blurRadius=4;
+static const int blurRadius=2;
 /*Enable Pixelation*/
 #define PIXELATION
 /*Set pixelation radius*/
-static const int pixelSize=2;
+static const int pixelSize=4;
